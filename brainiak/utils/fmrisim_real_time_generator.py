@@ -42,6 +42,8 @@ import gzip
 __all__ = ["generate_data"]
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.StreamHandler())
+logger.setLevel(logging.DEBUG)
 
 script_datetime = datetime.datetime.now()
 
@@ -508,7 +510,158 @@ def generate_data(outputDir,
             # Save the volume as a DICOM file, with each TR as its own file
             output_file = os.path.join(outputDir, 'rt_' + format(idx, '03d')
                                        + '.dcm')
-            _write_dicom(output_file, brain_int32, idx+1)
+            _write_dicom(output_file, brain_int32, idx + 1)
+        else:
+            # Save the volume as a numpy file, with each TR as its own file
+            output_file = os.path.join(outputDir, 'rt_' + format(idx, '03d')
+                                       + '.npy')
+            np.save(output_file, brain_int32)
+
+        logger.info("Generate {}".format(output_file))
+
+        # Sleep until next TR
+        if data_dict['save_realtime'] == 1:
+            time.sleep(data_dict['trDuration'])
+
+
+def generate_resting_data(outputDir,
+                          user_settings):
+    """Generate simulated fMRI resting state
+    Use a few parameters that might be relevant for real time analysis
+
+    Parameters
+    ----------
+
+    outputDir : str
+        Specify output data dir where the data should be saved
+
+    user_settings : dict
+        A dictionary to specify the parameters used for making data,
+        specifying the following keys
+        numTRs - int - Specify the number of time points
+        multivariate_patterns - bool - Is the difference between conditions
+        univariate (0) or multivariate (1)
+        different_ROIs - bool - Are there different ROIs for each condition (
+        1) or is it in the same ROI (0). If it is the same ROI and you are
+        using univariate differences, the second condition will have a
+        smaller evoked response than the other.
+        event_duration - int - How long, in seconds, is each event
+        scale_percentage - float - What is the percent signal change
+        trDuration - float - How many seconds per volume
+        save_dicom - bool - Save to data as a dicom (1) or numpy (0)
+        save_realtime - bool - Do you want to save the data in real time (1)
+        or as fast as possible (0)?
+        isi - float - What is the time between each event (in seconds)
+        burn_in - int - How long before the first event (in seconds)
+
+    """
+    data_dict = default_settings.copy()
+    data_dict.update(user_settings)
+    print (data_dict)
+
+    # If the folder doesn't exist then make it
+    if not os.path.exists(outputDir):
+        os.mkdir(outputDir)
+
+    logger.info('Load template of average voxel value')
+
+    # Get the file names needed for loading in the data
+    ROI_A_file, ROI_B_file, template_path, noise_dict_file = \
+        _get_input_names(data_dict)
+
+    # Load in the template data (it may already be loaded if doing a test)
+    if isinstance(template_path, str):
+        template_nii = nibabel.load(template_path)
+        template = template_nii.get_data()
+    else:
+        template = template_path
+
+    dimensions = np.array(template.shape[0:3])
+
+    logger.info('Create binary mask and normalize the template range')
+    mask, template = sim.mask_brain(volume=template,
+                                    mask_self=True,
+                                    )
+
+    # Write out the mask as a numpy file
+    outFile = os.path.join(outputDir, 'mask.npy')
+    np.save(outFile, mask.astype(np.uint8))
+
+    # Load the noise dictionary
+    logger.info('Loading noise parameters')
+
+    # If this isn't a string, assume it is a resource stream file
+    if type(noise_dict_file) is str:
+        with open(noise_dict_file, 'r') as f:
+            noise_dict = f.read()
+    else:
+        # Read the resource stream object
+        noise_dict = noise_dict_file.decode()
+
+    noise_dict = eval(noise_dict)
+    noise_dict['matched'] = 0  # Increases processing time
+
+    # Add it here for easy access
+    data_dict['noise_dict'] = noise_dict
+
+    logger.info('Generating noise')
+    temp_stimfunction = np.zeros((data_dict['numTRs'], 1))
+    noise = sim.generate_noise(dimensions=dimensions,
+                               stimfunction_tr=temp_stimfunction,
+                               tr_duration=int(data_dict['trDuration']),
+                               template=template,
+                               mask=mask,
+                               noise_dict=noise_dict,
+                               )
+
+    # Create the stimulus time course of the conditions
+    total_time = int(data_dict['numTRs'] * data_dict['trDuration'])
+    episodic_event = []
+    # No burn in for resting state
+    curr_time = data_dict['burn_in']
+    while curr_time < (total_time - data_dict['event_duration']):
+        episodic_event.append(curr_time)
+
+        # Increment the current time
+        curr_time += data_dict['event_duration'] + data_dict['isi']
+
+    # How many timepoints per second of the stim function are to be generated?
+    temporal_res = 1 / data_dict['trDuration']
+
+    # Create a time course of events
+    event_durations = [data_dict['event_duration']]
+    stimfunc_A = sim.generate_stimfunction(onsets=episodic_event,
+                                           event_durations=event_durations,
+                                           total_time=total_time,
+                                           temporal_resolution=temporal_res,
+                                           )
+
+    # Create a labels timecourse
+    outFile = os.path.join(outputDir, 'labels.npy')
+    np.save(outFile, stimfunc_A)
+
+    # How is the signal implemented in the different ROIs
+    signal = _generate_ROIs(ROI_A_file,
+                            stimfunc_A,
+                            noise,
+                            data_dict['scale_percentage'],
+                            data_dict)
+
+    logger.info('Generating TRs in real time')
+    for idx in range(data_dict['numTRs']):
+
+        #  Create the brain volume on this TR
+        brain = noise[:, :, :, idx] + signal[:, :, :, idx]
+
+        # Convert file to integers to mimic what you get from MR
+        brain_int32 = brain.astype(np.int32)
+
+        # Store as dicom or nifti?
+        if data_dict['save_dicom'] is True:
+            # Save the volume as a DICOM file, with each TR as its own file
+            output_file = os.path.join(outputDir, 'rt_' + format(idx, '03d')
+                                       + '.dcm')
+            _write_dicom(output_file, brain_int32, idx + 1)
         else:
             # Save the volume as a numpy file, with each TR as its own file
             output_file = os.path.join(outputDir, 'rt_' + format(idx, '03d')
